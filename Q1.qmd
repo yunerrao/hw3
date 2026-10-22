@@ -1,0 +1,125 @@
+---
+title: "Homework3"
+author: "Yuner Rao"
+format:
+  html:
+    self-contained: true  
+    code-fold: true        
+    code-summary: "Show the code"
+---
+
+```{r}
+#| label: setup
+#| echo: false
+install.packages("haven",repos = "https://cran.r-project.org")
+install.packages("tidyverse",repos = "https://cran.r-project.org")
+library(haven)
+library(tidyverse)
+library(knitr)
+library(broom)
+```
+
+## Q1-(a)
+
+```{r}
+#| echo: true
+read_and_merge <- function(){
+  aux <- read_xpt("AUX_I.xpt")
+  demo <- read_xpt("DEMO_I.xpt")
+  merged <- inner_join(aux, demo, by = "SEQN")
+  return(merged)
+}
+
+df_raw <- read_and_merge()
+cat("Merged dataset dimensions (rows, columns):\n")
+print(dim(df_raw))
+```
+
+I perform an inner join on the identifier `SEQN`. Only records that appear in both datasets are kept.We can now see the merged dimensions (4852,119)
+
+## Q1-(b)
+
+```{r}
+clean_data <- function(df_raw){
+  df_clean <- df_raw %>%
+    mutate(
+      # Gender: 1=Male, 2=Female
+      gender = ifelse(RIAGENDR %in% c(99,999,-9,NA), NA, RIAGENDR),
+      gender = factor(gender, levels = c(1,2), labels = c("Male","Female")),
+      # Citizenship status
+      citizenship = ifelse(DMDCITZN %in% c(99,999,-9,NA), NA, DMDCITZN),
+      citizenship = factor(citizenship),
+      # Income-to-poverty ratio (continuous)
+      income_poverty = ifelse(INDFMPIR %in% c(99,999,-9,NA), NA, INDFMPIR),
+      income_poverty = as.numeric(income_poverty),
+      # Right ear tympanometric width
+      tymp_right = ifelse(AUXTWIDR %in% c(99,999,-9,NA), NA, AUXTWIDR),
+      tymp_right = as.numeric(tymp_right),
+      # Left ear tympanometric width
+      tymp_left = ifelse(AUXTWIDL %in% c(99,999,-9,NA), NA, AUXTWIDL),
+      tymp_left = as.numeric(tymp_left)
+    )
+  return(df_clean)
+}
+df_clean <- clean_data(df_raw)
+summary(df_clean %>% select(gender, citizenship, income_poverty, tymp_right, tymp_left))
+
+```
+
+I create a cleaned dataset starting from the merged data with 4582 observations.
+All invalid/missing codes (-9, 99, 999) are recoded into R native `NA`.
+`RIAGENDR` is converted to a labelled factor for gender.
+`DMDCITZN` (citizenship status) is converted to a categorical factor.
+`INDFMPIR` (income-to-poverty ratio) is kept as a continuous predictor.
+`AUXTWIDR` and `AUXTWIDL` are the continuous tympanometric width outcomes for right and left ear, used in the Poisson regression models.
+
+## Q1-(c)
+
+```{r}
+fit_poisson <- function(formula, data){
+  mod <- glm(formula, family = poisson(link = "log"), data = data)
+  irr_table <- tidy(mod, conf.int = TRUE, exponentiate = TRUE) %>%
+    select(term, estimate, conf.low, conf.high, p.value) %>%
+    rename(IRR = estimate, CI_low = conf.low, CI_high = conf.high, p_val = p.value)
+  null_mod <- glm(update(formula, . ~ 1), family = poisson(link="log"), data = data)
+  mcfadden_r2 <- 1 - as.numeric(logLik(mod)) / as.numeric(logLik(null_mod))
+  fit_stats <- tibble(
+    n = nrow(mod$model),
+    AIC = AIC(mod),
+    McFadden_pseudoR2 = mcfadden_r2
+  )
+  return(list(irr = irr_table, stats = fit_stats, model_obj = mod))
+}
+m1R <- fit_poisson(tymp_right ~ gender, df_clean)
+m2R <- fit_poisson(tymp_right ~ gender + citizenship + income_poverty, df_clean)
+m1L <- fit_poisson(tymp_left ~ gender, df_clean)
+m2L <- fit_poisson(tymp_left ~ gender + citizenship + income_poverty, df_clean)
+irr_all <- bind_rows(
+  m1R$irr %>% mutate(Model = "1R: Right ~ Gender"),
+  m2R$irr %>% mutate(Model = "2R: Right ~ Full"),
+  m1L$irr %>% mutate(Model = "1L: Left ~ Gender"),
+  m2L$irr %>% mutate(Model = "2L: Left ~ Full")
+) %>%
+  select(Model, term, IRR, CI_low, CI_high, p_val) %>%
+  mutate(across(c(IRR, CI_low, CI_high), ~round(.x,3)), p_val = round(p_val,4))
+stat_all <- bind_rows(
+  m1R$stats %>% mutate(Model = "1R: Right ~ Gender"),
+  m2R$stats %>% mutate(Model = "2R: Right ~ Full"),
+  m1L$stats %>% mutate(Model = "1L: Left ~ Gender"),
+  m2L$stats %>% mutate(Model = "2L: Left ~ Full")
+) %>%
+  select(Model, n, AIC, McFadden_pseudoR2) %>%
+  mutate(across(c(AIC, McFadden_pseudoR2), ~round(.x,3)))
+kable(irr_all, caption = "Incidence Risk Ratios from Poisson Regression Models", format = "html")
+kable(stat_all, caption = "Model Fit Summary Statistics", format = "html")
+```
+
+Results are reported as incidence risk ratios (IRR). IRR \> 1 indicates a higher expected tympanometric width, and significance holds when the 95% CI does not contain 1.
+
+In both simple and adjusted models, females have significantly greater tympanometric width than males. Citizenship category 2 is positively associated with wider width for both ears; citizenship category 7 is significant only for the right ear. Higher income-to-poverty ratio is linked to slightly smaller width.
+
+The full adjusted models yield lower AIC and modest McFadden pseudo-\\(R\^2\\) (0.101 for right ear, 0.092 for left ear), showing citizenship and income improve model fit compared with gender-only models.
+
+## Q1-(d)
+
+This Poisson regression analysis examined associations between gender, citizenship, income-to-poverty ratio and tympanometric width. Females had significantly larger tympanometric width in both simple and fully adjusted models. Citizenship status and income-to-poverty ratio were also significant predictors. The full models had better fit than gender-only models. These findings suggest demographic and socioeconomic factors are associated with tympanometric width.
