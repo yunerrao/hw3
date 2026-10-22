@@ -22,7 +22,6 @@ library(broom)
 ## Q1-(a)
 
 ```{r}
-#| echo: true
 read_and_merge <- function(){
   aux <- read_xpt("AUX_I.xpt")
   demo <- read_xpt("DEMO_I.xpt")
@@ -123,3 +122,322 @@ The full adjusted models yield lower AIC and modest McFadden pseudo-\\(R\^2\\) (
 ## Q1-(d)
 
 This Poisson regression analysis examined associations between gender, citizenship, income-to-poverty ratio and tympanometric width. Females had significantly larger tympanometric width in both simple and fully adjusted models. Citizenship status and income-to-poverty ratio were also significant predictors. The full models had better fit than gender-only models. These findings suggest demographic and socioeconomic factors are associated with tympanometric width.
+
+## Q2-(a)
+
+```{r}
+library(DBI)
+library(RSQLite)
+library(tidyverse)
+library(microbenchmark)
+con <- dbConnect(SQLite(), dbname = "sakila_master.db")
+dbListTables(con)
+## Method 1: SQL pull table first, then compute in R
+pull_sql <- "SELECT store_id, active FROM customer;"
+df_customer <- dbGetQuery(con, pull_sql)
+
+q1_method1 <- function(){
+  df_customer %>%
+    mutate(active = as.integer(active)) %>% 
+    group_by(store_id) %>%
+    summarise(
+      total_cust = n(),
+      active_cust = sum(active),
+      pct_active = active_cust / total_cust,
+      .groups = "drop"
+    )
+}
+
+## Method 2: single SQL
+single_sql <- "
+SELECT
+  store_id,
+  COUNT(*) AS total_cust,
+  SUM(CAST(active AS INTEGER)) AS active_cust,
+  ROUND(SUM(CAST(active AS INTEGER)) * 1.0 / COUNT(*), 4) AS pct_active
+FROM customer
+GROUP BY store_id;
+"
+
+q1_method2 <- function(){
+  dbGetQuery(con, single_sql)
+}
+
+# benchmark
+bm1 <- microbenchmark(
+  R_after_sql = q1_method1(),
+  single_sql = q1_method2(),
+  times = 20
+)
+
+bm1
+autoplot(bm1)
+
+# print results
+q1_method1()
+q1_method2()
+
+```
+
+We calculated the total number of customers per store and the percentage of active customers for each store using two approaches.
+
+Method 1: Extract the raw `customer` table with SQL and perform aggregation in R.
+
+Method 2: Compute the final result directly with a single SQL query.Both methods return identical outputs:
+Store 1 has 326 customers, with 97.55% active customers.
+Store 2 has 273 customers, with 97.44% active customers.
+
+From `microbenchmark`, the single-SQL method is substantially faster. The median runtime for the single SQL query is 460.29 microseconds, while the two-step approach (SQL pull + R manipulation) has a median runtime of 3108.09 microseconds. This is expected because the database engine optimizes aggregation natively, and the two-step method incurs extra overhead from transferring the full table to R and additional tidyverse operations.
+
+## Q2-(b)
+
+```{r}
+## Method 1: SQL to pull all needed tables, then join in R
+pull_sql <- "
+SELECT s.first_name, s.last_name, a.city_id, c.country
+FROM staff s
+JOIN address a ON s.address_id = a.address_id
+JOIN city ci ON a.city_id = ci.city_id
+JOIN country c ON ci.country_id = c.country_id;
+"
+df_staff <- dbGetQuery(con, pull_sql)
+
+q2_method1 <- function(){
+  df_staff %>%
+    select(first_name, last_name, country)
+}
+
+## Method 2: Single SQL query
+single_sql <- "
+SELECT s.first_name, s.last_name, c.country
+FROM staff s
+JOIN address a ON s.address_id = a.address_id
+JOIN city ci ON a.city_id = ci.city_id
+JOIN country c ON ci.country_id = c.country_id;
+"
+q2_method2 <- function(){
+  dbGetQuery(con, single_sql)
+}
+# benchmark
+bm2 <- microbenchmark(
+  R_after_sql = q2_method1(),
+  single_sql = q2_method2(),
+  times = 20
+)
+
+bm2
+autoplot(bm2)
+# print results
+q2_method1()
+q2_method2()
+
+```
+
+Two methods produce identical results, listing staff names and their countries: Mike Hillyer is from Canada, and Jon Stephens is from Australia. The single SQL query runs faster. Its median runtime is 571.62 microseconds, compared with 1605.52 microseconds for the approach that pulls extra columns into R and selects variables afterwards. Joining tables and selecting required fields inside SQLite reduces data transfer overhead.
+
+## Q2-(c)
+
+```{r}
+## Method1: Query raw data from SQL, then aggregate in R
+pull_sql <- "
+SELECT f.title, p.amount
+FROM payment p
+JOIN rental r ON p.rental_id = r.rental_id
+JOIN inventory i ON r.inventory_id = i.inventory_id
+JOIN film f ON i.film_id = f.film_id;
+"
+df_revenue <- dbGetQuery(con, pull_sql)
+
+q3_method1 <- function(){
+  df_revenue %>%
+    group_by(title) %>%
+    summarise(total_revenue = sum(amount, na.rm = TRUE)) %>%
+    arrange(desc(total_revenue)) %>%
+    slice(1)
+}
+
+## Method2: Single SQL query to compute and find the top film
+single_sql <- "
+SELECT f.title, SUM(p.amount) AS total_revenue
+FROM payment p
+JOIN rental r ON p.rental_id = r.rental_id
+JOIN inventory i ON r.inventory_id = i.inventory_id
+JOIN film f ON i.film_id = f.film_id
+GROUP BY f.title
+ORDER BY total_revenue DESC
+LIMIT 1;
+"
+
+q3_method2 <- function(){
+  dbGetQuery(con, single_sql)
+}
+
+# benchmark
+bm3 <- microbenchmark(
+  R_after_sql = q3_method1(),
+  single_sql = q3_method2(),
+  times = 20
+)
+
+bm3
+autoplot(bm3)
+
+# output result
+q3_method1()
+q3_method2()
+
+```
+
+Both methods identify **TELEGRAPH VOYAGE** as the film with the highest rental revenue, which totals \$231.73. Contrary to the previous two cases, the two‑step approach (fetch raw data to R and aggregate locally) runs faster here. Its mean runtime is 8.36 ms, while the single SQL query averages 46.21 ms. This may be caused by SQLite’s overhead for grouping and sorting on a large payment table.
+
+## Q3-(a)
+
+```{r}
+library(tidyverse)
+
+df <- read_csv("au-500.csv", show_col_types = FALSE)
+
+q1 <- df %>%
+  filter(!is.na(web) & web != "") %>%
+  mutate(
+    tld = str_extract(web, "\\.[^.]+$"),
+    is_com = (tld == ".com")
+  ) %>%
+  summarise(
+    total_valid = n(),
+    com_count = sum(is_com),
+    pct_com = mean(is_com) * 100
+  )
+
+q1
+cat(sprintf("Percentage of websites that are .com: %.2f %% \n", q1$pct_com))
+
+```
+
+All website entries in this dataset are Australian domains such as `.com.au`, none end with the simple top-level domain `.com`. Hence the percentage of `.com` websites is 0.00%.
+
+## Q3-(b)
+
+```{r}
+library(tidyverse)
+
+q2 <- df %>%
+  filter(!is.na(email) & email != "") %>%
+  mutate(
+    domain = str_extract(email, "(?<=@).+")
+  ) %>%
+  count(domain, sort = TRUE)
+
+q2
+
+```
+
+We extracted the substring after `@` from each valid email to get the domain name, counted frequencies, and sorted in descending order. `hotmail.com` is the most frequent email domain in this dataset.
+
+## Q3-(c)
+
+```{r}
+library(tidyverse)
+q3 <- df %>%
+  filter(!is.na(company_name) & company_name != "") %>%
+  mutate(
+   
+    has_special_a = str_detect(company_name, "[^A-Za-z, ]"),
+    
+    has_special_b = str_detect(company_name, "[^A-Za-z, & ]")
+  ) %>%
+  summarise(
+    total_valid = n(),
+    prop_special_a = mean(has_special_a),
+    prop_special_b = mean(has_special_b)
+  )
+
+q3
+
+cat(sprintf(
+  "Proportion with special characters (exclude comma, space): %.4f\nProportion with special characters (exclude comma, space, &): %.4f\n",
+  q3$prop_special_a, q3$prop_special_b
+))
+
+```
+
+Part (a): 9% of company names contain characters other than letters, commas and spaces. Part (b): when `&` is also treated as an allowed character, only 0.8% of company names have remaining special characters.
+
+## Q3-(d)
+
+```{r}
+library(tidyverse)
+
+reformat_phone <- function(x) {
+  digits <- str_remove_all(x, "[^0-9]")
+  if (nchar(digits) == 10) {
+    str_c(str_sub(digits,1,4), " ", str_sub(digits,5,7), " ", str_sub(digits,8,10))
+  } else {
+    x
+  }
+}
+
+q4 <- df %>%
+  mutate(
+    phone1_formatted = map_chr(phone1, reformat_phone),
+    phone2_formatted = map_chr(phone2, reformat_phone)
+  ) %>%
+  select(phone1, phone1_formatted, phone2, phone2_formatted)
+
+head(q4,10)
+
+```
+
+> We remove all non‑numeric symbols from raw phone numbers. Numbers with exactly 10 digits are rearranged into the `dddd ddd ddd` format; the original values are kept otherwise. The first ten records are displayed for verification.
+
+## Q3-(e)
+
+```{r}
+library(tidyverse)
+
+df <- df %>%
+  mutate(
+    unit_str = str_extract(address, regex("(Unit|Flat|Apt|Suite)\\s*(\\d+)", ignore_case = TRUE)),
+    unit_num = str_extract(unit_str, "\\d+") %>% as.numeric()
+  )
+
+ggplot(df %>% filter(!is.na(unit_num)), aes(x = unit_num)) +
+  geom_histogram(bins = 15, fill = "steelblue", alpha = 0.7) +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of extracted unit numbers (log10 scale)",
+    x = "Unit number (log10)",
+    y = "Count"
+  ) +
+  theme_minimal()
+df %>% select(address, unit_str, unit_num) %>% head(10)
+
+```
+
+> The regex only captures unit numbers marked by keywords like Unit/Flat/Apt/Suite. Most addresses in this dataset do not follow this format, so nearly all extracted values are NA, resulting in an empty histogram.
+
+## Q3-(f)
+
+```{r}
+library(tidyverse)
+df <- df %>%
+  mutate(
+    hash_unit = str_extract(address, "#\\s*(\\d+)"),
+    hash_unit_num = str_extract(hash_unit, "\\d+") %>% as.numeric(),
+    all_unit_num = coalesce(unit_num, hash_unit_num)
+  )
+
+ggplot(df %>% filter(!is.na(all_unit_num)), aes(x = all_unit_num)) +
+  geom_histogram(bins = 15, fill = "coral", alpha = 0.7) +
+  scale_x_log10() +
+  labs(
+    title = "Unit numbers extracted from # and Unit/Flat tags (log10)",
+    x = "Unit number (log10)",
+    y = "Count"
+  ) +
+  theme_minimal()
+df %>% select(address, unit_str, hash_unit, all_unit_num) %>% head(10)
+
+```
+
+We extract unit numbers from two patterns: `#number` and labels like Unit/Flat. `coalesce` combines the two sources. The histogram on a log10 scale shows the distribution of successfully extracted unit numbers.
